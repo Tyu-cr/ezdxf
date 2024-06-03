@@ -631,8 +631,16 @@ class LinetypeStage2d(RenderStage2d):
 
         renderer = linetypes.LineTypeRenderer(self.pattern(properties))
         vertices = path.flattening(self.config.max_flattening_distance, segments=16)
+
+        threshold = 0.001747509
+        vectors = [(Vec2(s), Vec2(e)) for s, e in renderer.line_segments(vertices)]
+
+        def calculate_difference(point1: Vec2, point2: Vec2) -> float:
+            return abs(point1.x - point2.x) + abs(point1.y - point2.y)
+
+        vectors = [pair for pair in vectors if calculate_difference(pair[0], pair[1]) >= threshold]
         next_stage.draw_solid_lines(
-            [(Vec2(s), Vec2(e)) for s, e in renderer.line_segments(vertices)],
+            vectors,
             properties,
         )
 

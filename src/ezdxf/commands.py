@@ -506,6 +506,115 @@ class View(Command):
 
 
 @register
+class Image(Command):
+    """Launcher sub-command: image"""
+
+    NAME = "image"
+
+    @staticmethod
+    def add_parser(subparsers):
+        parser = subparsers.add_parser(
+            Image.NAME, help="convert DXF files into images"
+        )
+        parser.add_argument(
+            "file",
+            metavar="FILE",
+            nargs="?",
+            help="DXF file to convert",
+        )
+        parser.add_argument(
+            "-l",
+            "--layout",
+            default="Model",
+            help='select the layout to draw, default is "Model"',
+        )
+        parser.add_argument(
+            "-f",
+            "--format",
+            default="jpg",
+            choices=["jpg", "png"],
+            help="choose the format of image",
+        )
+        parser.add_argument(
+            "--dpi",
+            type=int,
+            default=2000,
+            help="target render resolution, default is 2000",
+        )
+        parser.add_argument(
+            "--background",
+            default="#FFFFFF",
+            help="choose the background color to use",
+        )
+        parser.add_argument(
+            "--name",
+            required=False,
+            type=pathlib.Path,
+            default=None,
+            help="custom name for the output file",
+        )
+
+    @staticmethod
+    def run(args):
+        try:
+            import matplotlib.pyplot as plt
+            from ezdxf.addons.drawing.config import Configuration
+            from ezdxf.addons.drawing import RenderContext, Frontend
+            from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+            from ezdxf.addons.drawing.properties import LayoutProperties
+        except ImportError as e:
+            print(str(e))
+            sys.exit(1)
+
+        if args.file:
+            filename = args.file
+        else:
+            print("argument FILE is required")
+            sys.exit(1)
+
+        print(f"Converting file: {filename}")
+
+        doc, auditor = load_document(filename)
+
+        try:
+            layout = doc.layouts.get(args.layout)
+        except KeyError:
+            print(
+                f'Could not find layout "{args.layout}". '
+                f"Valid layouts: {[l.name for l in doc.layouts]}"
+            )
+            sys.exit(1)
+
+        config = Configuration(
+            pdmode=33,
+            min_lineweight=0.05,
+            background_policy=args.background,
+        )
+
+        fig = plt.figure()
+        ax = fig.add_axes((0, 0, 1, 1))
+        ctx = RenderContext(doc)
+        ctx.set_current_layout(layout)
+
+        layout_properties = LayoutProperties(name=args.layout, background_color=args.background)
+
+        out = MatplotlibBackend(ax)
+        front = Frontend(ctx, out, config=config)
+        front.draw_layout(layout, finalize=True, layout_properties=layout_properties)
+
+        if args.name is None:
+            base_name = os.path.splitext(os.path.basename(filename))[0]
+        img_name = base_name
+
+        # Extract directory path
+        directory = os.path.dirname(filename)
+        img_path = os.path.join(directory, img_name + "." + args.format)
+        fig.savefig(img_path, dpi=args.dpi)
+        plt.close(fig)
+        print(f"{filename} converted successfully. Saved at: {img_path}")
+
+
+@register
 class Browse(Command):
     """Launcher sub-command: browse"""
 

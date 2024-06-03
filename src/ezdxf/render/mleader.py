@@ -204,7 +204,11 @@ def get_arrow_direction(vertices: list[Vec3]) -> Vec3:
     if len(vertices) < 2:
         return X_AXIS
     direction = vertices[1] - vertices[0]
-    return direction.normalize()
+    # TODO: Have no idea how to fix zero division, however try except works fine
+    try:
+        return direction.normalize()
+    except ZeroDivisionError:
+        return X_AXIS
 
 
 ACI_COLOR_TYPES = {

@@ -35,10 +35,13 @@ def encode(s: str, encoding="utf8") -> bytes:
 
 
 def _decode(s: str) -> str:
+    # Skip broken characters
     if s.startswith(r"\U+"):
-        return chr(int(s[3:], 16))
-    else:
-        return s
+        try:
+            return chr(int(s[3:], 16))
+        except ValueError:
+            return s
+    return s
 
 
 def has_dxf_unicode(s: str) -> bool:

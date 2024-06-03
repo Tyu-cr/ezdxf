@@ -771,7 +771,10 @@ class UniversalFrontend:
                 text_width = font.text_width_ex(text, default_cap_height)
                 image_size = image.dxf.image_size
                 desired_width = image_size.x * 0.75
-                scale = desired_width / text_width
+                if text_width == 0:
+                    scale = desired_width
+                else:
+                    scale = desired_width / text_width
                 translate = Matrix44.translate(
                     (image_size.x - desired_width) / 2,
                     (image_size.y - default_cap_height * scale) / 2,
@@ -861,7 +864,9 @@ class UniversalFrontend:
                     points = polygon  # type: ignore
                 # Set default SOLID filling for LWPOLYLINE
                 properties.filling = Filling()
-                self.pipeline.draw_filled_polygon(points, properties)
+                # Skip empty lists
+                if points:
+                    self.pipeline.draw_filled_polygon(points, properties)
             return
         polyline_path = make_path(entity)
         if len(polyline_path):
@@ -1005,6 +1010,7 @@ def _draw_entities(
     *,
     filter_func: Optional[FilterFunc] = None,
 ) -> None:
+    min_lineweight = frontend.config.min_lineweight
     if filter_func is not None:
         entities = filter(filter_func, entities)
     viewports: list[Viewport] = []
@@ -1019,6 +1025,10 @@ def _draw_entities(
                 frontend.skip_entity(entity, "Cannot parse DXF entity")
                 continue
         properties = ctx.resolve_all(entity)
+
+        if min_lineweight is not None and properties.lineweight > min_lineweight:
+            properties.lineweight = min_lineweight
+
         frontend.exec_property_override(entity, properties)
         if properties.is_visible:
             frontend.draw_entity(entity, properties)
