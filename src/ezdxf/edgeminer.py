@@ -9,12 +9,86 @@ A module for detecting linked edges.
 The complementary module ezdxf.edgesmith can create entities from the output of this 
 module.
 
+Terminology
+-----------
+
+I try to use the terminology of `Graph Theory`_ but there are differences where I think
+a different term is better suited for this module like loop for cycle.
+
+Edge
+    An edge has:
+        - unique id
+        - 3D start point (vertex)
+        - 3D end point (vertex)
+        - optional length
+        - optional payload (arbitrary data)
+
+    The geometry of an edge is not known.
+    Intersection points of edges are not known.
+
+Vertex
+    A connection point of two or more edges. 
+    The degree of a vertex is the number of connected edges.
+    A leaf or pendent vertex, a vertex of degree 1
+
+Chain
+    A chain has sequential connected edges. 
+    The end point of an edge is connected to the start point of the following edge. 
+    A chain has unique edges, each edge appears only once in the chain.
+    A loop can contain vertices with a degree > 2.
+    A solitary edge is also a chain.
+    Chains are represented as Sequence[Edge].
+
+Open Chain
+    An open chain is a chain with at least one loose end (leaf). 
+    A loose end is an edge point without a connection to other edges. 
+    A solitary edge is also an open chain.
+
+Loop
+    A loop is a chain with two or more edges.
+    The end point of the last edge is connected to the start point of the first edge.
+    A loop can contain vertices with a degree > 2 like the number 8.
+    A solitary edge is not a loop.
+
+    .. Note:: 
+    
+        In `Graph Theory`_ this loop would be a cycle and a loop in Graph Theory is 
+        something different.
+
+Network
+    A network has two or more edges that are directly and indirectly connected. 
+    The edges in a network have no order.
+    A network can contain vertices with a degree > 2, these are crossings with two or 
+    more connected edges. (multiple adjacency)
+    A solitary edge is not a network. 
+    A chain with two or more edges is a network. 
+    Networks are represented as Sequence[Edge].
+
+    .. Note::
+        
+        In `Graph Theory`_   this is a multigraph and network in Graph Theory 
+        is something different.
+
+Gap Tolerance
+    Maximum vertex distance to consider two edges as connected
+
+Forward Connection
+    An edge is forward connected when the end point of the edge is connected to the 
+    start point of the following edge.
+
+Backwards Connection
+    An edge is backwards connected when the start point of the edge is connected to the 
+    end point of the previous edge.
+
 .. versionadded:: 1.4
+
+.. _Graph Theory: https://en.wikipedia.org/wiki/Glossary_of_graph_theory
 
 """
 from __future__ import annotations
 from typing import Any, Sequence, Iterator, Iterable, Dict, Tuple
 from typing_extensions import Self, TypeAlias
+from collections import Counter
 import time
 
 from ezdxf.math import UVec, Vec3, distance_point_line_3d
@@ -22,17 +96,16 @@ from ezdxf.math import rtree
 
 
 __all__ = [
+    "count_degrees",
     "Edge",
     "EdgeDeposit",
-    "find_all_chains_in_deposit",
     "find_all_chains",
-    "find_all_loops_in_deposit",
     "find_all_loops",
     "find_all_sequential",
-    "find_chain_in_deposit",
-    "find_loop_in_deposit",
     "find_loop",
+    "find_open_chains",
     "find_sequential",
+    "flatten",
     "is_backwards_connected",
     "is_chain",
     "is_forward_connected",
@@ -42,6 +115,7 @@ __all__ = [
     "longest_chain",
     "shortest_chain",
     "TimeoutError",
+    "unique_chains",
     "unwrap_chain",
     "wrap_chain",
 ]
@@ -49,12 +123,16 @@ GAP_TOL = 1e-9
 TIMEOUT = 60.0  # in seconds
 
 
-class EdgeMinerException(Exception):
-    pass
+class EdgeMinerException(Exception): ...
+
+
+class InternalError(EdgeMinerException): ...
 
 
 class TimeoutError(EdgeMinerException):
-    pass
+    def __init__(self, msg: str, solutions: Sequence[Sequence[Edge]] = tuple()) -> None:
+        super().__init__(msg)
+        self.solutions = solutions
 
 
 class Edge:
@@ -70,12 +148,12 @@ class Edge:
         id: unique id as int
         start: start vertex as Vec3
         end: end vertex as Vec3
-        reverse: flag to indicate that the edge is reversed compared to its initial state
+        is_reverse: flag to indicate that the edge is reversed compared to its initial state
         length: length of the edge, default is the distance between start- and end vertex
         payload: arbitrary data associated to the edge
     """
 
-    __slots__ = ("id", "start", "end", "reverse", "length", "payload")
+    __slots__ = ("id", "start", "end", "is_reverse", "length", "payload")
     _next_id = 1
 
     def __init__(
@@ -85,7 +163,7 @@ class Edge:
         Edge._next_id += 1
         self.start = Vec3(start)
         self.end = Vec3(end)
-        self.reverse: bool = False
+        self.is_reverse: bool = False
         if length < 0.0:
             length = self.start.distance(self.end)
         self.length = length
@@ -98,10 +176,13 @@ class Edge:
         return False
 
     def __repr__(self) -> str:
-        if self.payload is None:
+        payload = self.payload
+        if payload is None:
             content = str(self.id)
+        elif isinstance(payload, EdgeWrapper):
+            content = "[" + (",".join(repr(e) for e in payload.edges)) + "]"
         else:
-            content = str(self.payload)
+            content = str(payload)
         return f"Edge({content})"
 
     def __hash__(self) -> int:
@@ -111,7 +192,7 @@ class Edge:
     def reversed(self) -> Self:
         """Returns a reversed copy."""
         edge = self.__class__(self.end, self.start, self.length, self.payload)
-        edge.reverse = not self.reverse
+        edge.is_reverse = not self.is_reverse
         edge.id = self.id  # reversed copies represent the same edge
         return edge
 
@@ -159,17 +240,20 @@ def is_chain(edges: Sequence[Edge], gap_tol=GAP_TOL) -> bool:
     return all(is_forward_connected(a, b, gap_tol) for a, b in zip(edges, edges[1:]))
 
 
-def is_loop(edges: Sequence[Edge], gap_tol=GAP_TOL, full=True) -> bool:
+def is_loop(edges: Sequence[Edge], gap_tol=GAP_TOL) -> bool:
     """Return ``True`` if the sequence of edges is a closed loop.
 
     Args:
         edges: sequence of edges
         gap_tol: maximum vertex distance to consider two edges as connected
-        full: does a full check if all edges have a forward connection if ``True``,
-            otherwise checks only if the last edge is connected to the first edge.
     """
-    if full and not is_chain(edges, gap_tol):
+    if not is_chain(edges, gap_tol):
         return False
+    return isclose(edges[-1].end, edges[0].start, gap_tol)
+
+
+def is_loop_fast(edges: Sequence[Edge], gap_tol=GAP_TOL) -> bool:
+    """Internal fast loop check."""
     return isclose(edges[-1].end, edges[0].start, gap_tol)
 
 
@@ -277,6 +361,8 @@ def find_loop(
 ) -> Sequence[Edge]:
     """Returns the first closed loop found in `edges`.
 
+    Returns only simple loops, where all vertices have only two adjacent edges.
+
     .. note::
 
         Recursive backtracking algorithm with time complexity of O(n!).
@@ -290,14 +376,28 @@ def find_loop(
         TimeoutError: search process has timed out
         TypeError: invalid data in sequence `edges`
     """
-    deposit = EdgeDeposit(edges, gap_tol=gap_tol)
+    chains = find_all_chains(edges, gap_tol)
+    if not chains:
+        return tuple()
+
+    packed_edges: list[Edge] = []
+    for chain in chains:
+        if len(chain) > 1:
+            if is_loop_fast(chain, gap_tol):
+                return chain
+            packed_edges.append(_wrap_chain(chain))
+        else:
+            packed_edges.append(chain[0])
+    deposit = EdgeDeposit(packed_edges, gap_tol)
     if len(deposit.edges) < 2:
         return tuple()
-    return find_loop_in_deposit(deposit, timeout=timeout)
+    return tuple(flatten(find_loop_in_deposit(deposit, timeout=timeout)))
 
 
 def find_loop_in_deposit(deposit: EdgeDeposit, timeout=TIMEOUT) -> Sequence[Edge]:
     """Returns the first closed loop found in edge `deposit`.
+
+    Returns only simple loops, where all vertices have only two adjacent edges.
 
     .. note::
 
@@ -324,7 +424,9 @@ def find_loop_in_deposit(deposit: EdgeDeposit, timeout=TIMEOUT) -> Sequence[Edge
 def find_all_loops(
     edges: Sequence[Edge], gap_tol=GAP_TOL, timeout=TIMEOUT
 ) -> Sequence[Sequence[Edge]]:
-    """Returns all unique closed loops and doesn't include reversed solutions.
+    """Returns all closed loops and doesn't include reversed solutions.
+
+    Returns only simple loops, where all vertices have only two adjacent edges.
 
     .. note::
 
@@ -339,10 +441,37 @@ def find_all_loops(
         TimeoutError: search process has timed out
         TypeError: invalid data in sequence `edges`
     """
-    deposit = EdgeDeposit(edges, gap_tol=gap_tol)
+    chains = find_all_chains(edges, gap_tol)
+    if not chains:
+        return tuple()
+
+    solutions: list[Sequence[Edge]] = []
+    packed_edges: list[Edge] = []
+    for chain in chains:
+        if len(chain) > 1:
+            if is_loop_fast(chain, gap_tol):
+                # these loops have no ambiguities (junctions)
+                solutions.append(chain)
+            else:
+                packed_edges.append(_wrap_chain(chain))
+        else:
+            packed_edges.append(chain[0])
+
+    if not packed_edges:
+        return solutions
+
+    deposit = EdgeDeposit(packed_edges, gap_tol)
     if len(deposit.edges) < 2:
         return tuple()
-    return find_all_loops_in_deposit(deposit, timeout=timeout)
+    try:
+        result = find_all_loops_in_deposit(deposit, timeout=timeout)
+    except TimeoutError as err:
+        if err.solutions:
+            solutions.extend(err.solutions)
+            err.solutions = solutions
+        raise
+    solutions.extend(result)
+    return _unwrap_chains(solutions)
 
 
 def find_all_loops_in_deposit(
@@ -368,6 +497,20 @@ def find_all_loops_in_deposit(
         finder.search(edge)
     solutions.extend(finder)
     return solutions
+
+
+def unique_chains(chains: Sequence[Sequence[Edge]]) -> Iterator[Sequence[Edge]]:
+    """Filter duplicate chains and yields only unique chains.
+
+    Yields the first chain for chains which have the same set of edges. The order of the
+    edges is not important.
+    """
+    seen: set[frozenset[int]] = set()
+    for chain in chains:
+        key = frozenset(edge.id for edge in chain)
+        if not key in seen:
+            yield chain
+            seen.add(key)
 
 
 def type_check(edges: Sequence[Edge]) -> Sequence[Edge]:
@@ -419,6 +562,20 @@ class EdgeDeposit:
         self.gap_tol = gap_tol
         self.edges = type_check(tuple(edges))
         self.search_index = SpatialSearchIndex(self.edges)
+
+    def count_degrees(self) -> Counter[int]:
+        """Returns a degree counter for all vertices."""
+        counter: Counter[int] = Counter()
+        search = self.search_index.vertices_in_sphere
+        gap_tol = self.gap_tol
+        for edge in self.edges:
+            counter[len(search(edge.start, gap_tol))] += 1
+            counter[len(search(edge.end, gap_tol))] += 1
+        return Counter({k: v // k for k, v in counter.items()})
+
+    def max_degree(self) -> int:
+        """Returns the maximum degree of all vertices."""
+        return max(self.count_degrees().keys())
 
     def edges_linked_to(self, vertex: UVec, radius: float = -1) -> Sequence[Edge]:
         """Returns all edges linked to `vertex` in range of `radius`.
@@ -487,12 +644,29 @@ class EdgeDeposit:
         networks.sort(key=lambda n: len(n))
         return networks
 
+    def find_loose_ends(self) -> Iterator[Edge]:
+        """Yields all edges that have at least one end point without connection to other
+        edges.
+        """
+        for edge in self.edges:
+            if len(self.edges_linked_to(edge.start)) == 1:
+                yield edge
+            elif len(self.edges_linked_to(edge.end)) == 1:
+                yield edge
+
+
+def count_degrees(edges: Sequence[Edge], gap_tol=GAP_TOL) -> Counter[int]:
+    """Returns a degree counter for all edge vertices."""
+    return EdgeDeposit(edges, gap_tol).count_degrees()
+
 
 SearchSolutions: TypeAlias = Dict[Tuple[int, ...], Sequence[Edge]]
 
 
 class LoopFinder:
     """Find closed loops in an EdgeDeposit by a recursive backtracking algorithm.
+
+    Finds only simple loops, where all vertices have only two adjacent edges.
 
     (internal class)
     """
@@ -531,6 +705,11 @@ class LoopFinder:
         """Searches for all loops that begin at the given start edge.
 
         These are not all possible loops in the edge deposit!
+
+        Raises:
+            TimeoutError: search process has timed out, intermediate results are attached
+                TimeoutError.data
+
         """
         deposit = self._deposit
         gap_tol = self.gap_tol
@@ -539,7 +718,10 @@ class LoopFinder:
         todo: list[tuple[Edge, ...]] = [(start,)]  # "unlimited" recursion stack
         while todo:
             if watchdog.has_timed_out:
-                raise TimeoutError("search process has timed out")
+                raise TimeoutError(
+                    "search process has timed out",
+                    solutions=tuple(self._solutions.values()),
+                )
             chain = todo.pop()
             last_edge = chain[-1]
             end_point = last_edge.end
@@ -548,16 +730,17 @@ class LoopFinder:
             survivers = set(candidates) - set(chain)
             for edge in survivers:
                 if isclose(end_point, edge.start, gap_tol):
-                    last_edge = edge
+                    next_edge = edge
                 else:
-                    last_edge = edge.reversed()
-                extended_chain = chain + (last_edge,)
-                if isclose(last_edge.end, start_point, gap_tol):
-                    self.add_solution(extended_chain)
+                    next_edge = edge.reversed()
+                last_point = next_edge.end
+                if isclose(last_point, start_point, gap_tol):
+                    self.add_solution(chain + (next_edge,))
                     if stop_at_first_loop:
                         return
-                else:
-                    todo.append(extended_chain)
+                elif not any(isclose(last_point, e.end, gap_tol) for e in chain):
+                    # just loops, where all vertices have only two adjacent edges
+                    todo.append(chain + (next_edge,))
 
     def add_solution(self, loop: Sequence[Edge]) -> None:
         solutions = self._solutions
@@ -584,8 +767,9 @@ def loop_key(edges: Sequence[Edge], reverse=False) -> tuple[int, ...]:
 
 def find_all_chains(edges: Sequence[Edge], gap_tol=GAP_TOL) -> Sequence[Sequence[Edge]]:
     """Returns all sequences of connected edges and doesn't include reversed solutions.
-    The chains are broken at junctions, which means that all sequences have a linear
-    progression without ambiguities.
+
+    The chains are broken at junctions (vetices with more than 2 edges), which means
+    that all sequences have a linear progression without ambiguities.
 
     Args:
         edges: sequence of edges
@@ -602,8 +786,10 @@ def find_all_chains(edges: Sequence[Edge], gap_tol=GAP_TOL) -> Sequence[Sequence
 
 def find_all_chains_in_deposit(deposit: EdgeDeposit) -> Sequence[Sequence[Edge]]:
     """Returns all sequences of connected edges in the edge `deposit` and doesn't
-    include reversed solutions.  The chains are broken at junctions, which means that
-    all sequences have a linear progression without ambiguities.
+    include reversed solutions.
+
+    The chains are broken at junctions (vetices with more than 2 edges), which means
+    that all sequences have a linear progression without ambiguities.
     """
     if len(deposit.edges) < 1:
         return tuple()
@@ -619,7 +805,7 @@ def find_all_chains_in_deposit(deposit: EdgeDeposit) -> Sequence[Sequence[Edge]]
 def find_chain_in_deposit(deposit: EdgeDeposit, start: Edge) -> Sequence[Edge]:
     """Returns the chain containing the `start` edge."""
     forward_chain = _find_forward_chain(deposit, start)
-    if is_loop(forward_chain, deposit.gap_tol, full=False):
+    if is_loop_fast(forward_chain, deposit.gap_tol):
         return forward_chain
     backwards_chain = _find_forward_chain(deposit, start.reversed())
     if len(backwards_chain) == 1:
@@ -645,7 +831,7 @@ def _find_forward_chain(deposit: EdgeDeposit, edge: Edge) -> list[Edge]:
             chain.append(edge)
         else:
             chain.append(edge.reversed())
-        if is_loop(chain, gap_tol, full=False):
+        if is_loop_fast(chain, gap_tol):
             return chain
 
 
@@ -667,7 +853,7 @@ def wrap_chain(chain: Sequence[Edge], gap_tol=GAP_TOL) -> Edge:
     if len(chain) < 2:
         raise ValueError("two or more linked edges required")
     if is_chain(chain, gap_tol):
-        if is_loop(chain, gap_tol, full=False):
+        if is_loop_fast(chain, gap_tol):
             raise ValueError("closed loop cannot be wrapped into a single edge")
         return _wrap_chain(chain)
     raise ValueError("edges are not connected")
@@ -698,7 +884,186 @@ def _wrap_chain(edges: Sequence[Edge]) -> Edge:
 def _unwrap_chain(edge: Edge) -> Sequence[Edge]:
     wrapper = edge.payload
     assert isinstance(wrapper, EdgeWrapper)
-    if edge.reverse:
+    if edge.is_reverse:
         return tuple(e.reversed() for e in reversed(wrapper.edges))
     else:
         return wrapper.edges
+
+
+def _unwrap_chains(chains: Iterable[Iterable[Edge]]) -> Sequence[Sequence[Edge]]:
+    return tuple(tuple(flatten(chain)) for chain in chains)
+
+
+def flatten(edges: Edge | Iterable[Edge]) -> Iterator[Edge]:
+    """Yields all edges from any nested structure of edges as a flat stream of edges."""
+    edge: Edge
+    if not isinstance(edges, Edge):
+        for edge in edges:
+            yield from flatten(edge)
+    else:
+        edge = edges
+        if is_wrapped_chain(edge):
+            yield from flatten(_unwrap_chain(edge))
+        else:
+            yield edge
+
+
+def find_open_chains(
+    edges: Sequence[Edge], gap_tol=GAP_TOL, timeout=TIMEOUT
+) -> Sequence[Sequence[Edge]]:
+    """Returns all combinations of edges which create open chains with at least one
+    loose end.
+
+    A loose end is an edge end-point without further connections.  The result does not
+    include reversed solutions and closed loops.
+
+    .. note::
+
+        Recursive backtracking algorithm with time complexity of O(n!).
+
+    Args:
+        edges: sequence of edges
+        gap_tol: maximum vertex distance to consider two edges as connected
+        timeout: timeout in seconds
+
+    Raises:
+        TypeError: invalid data in sequence `edges`
+        TimeoutError: search process has timed out
+    """
+    return find_open_chains_in_deposit(EdgeDeposit(edges, gap_tol=gap_tol), timeout)
+
+
+def chain_key(edges: Sequence[Edge], reverse=False) -> tuple[int, ...]:
+    """Returns a normalized key."""
+    if reverse:
+        return tuple(edge.id for edge in reversed(edges))
+    else:
+        return tuple(edge.id for edge in edges)
+
+
+def find_open_chains_in_deposit(
+    deposit: EdgeDeposit, timeout=TIMEOUT
+) -> Sequence[Sequence[Edge]]:
+    """Returns all combinations of edges in deposit which create open chains with at
+    least one loose end.
+
+    A loose end is an edge end-point without further connections.  The result does not
+    include reversed solutions and closed loops
+
+    .. note::
+
+        Recursive backtracking algorithm with time complexity of O(n!).
+
+    Args:
+        edosit: EdgeDeposit
+        timeout: timeout in seconds
+
+    Raises:
+        TimeoutError: search process has timed out
+    """
+
+    finder = OpenChainFinder(deposit, timeout)
+    for edge in deposit.find_loose_ends():
+        finder.search(edge)
+    solutions = finder.solutions
+    solutions.sort(key=lambda x: len(x))
+    return solutions
+
+
+class OpenChainFinder:
+    def __init__(self, deposit: EdgeDeposit, timeout=TIMEOUT):
+        self.deposit = deposit
+        self.solution_keys: set[tuple[int, ...]] = set()
+        self.solutions: list[Sequence[Edge]] = []
+        self.watchdog = Watchdog(timeout)
+
+    def search(self, edge: Edge) -> None:
+        forward_chains = self.forward_search(edge)
+        self.reverse_search(forward_chains)
+
+    def forward_search(self, edge: Edge) -> list[tuple[Edge, ...]]:
+        deposit = self.deposit
+        gap_tol = deposit.gap_tol
+        watchdog = self.watchdog
+
+        forward_chains: list[tuple[Edge, ...]] = []
+        todo: list[tuple[Edge, ...]] = [(edge,)]
+        while todo:
+            if watchdog.has_timed_out:
+                raise TimeoutError("search has timed out")
+            chain = todo.pop()
+            start_point = chain[-1].end
+            candidates = deposit.edges_linked_to(start_point)
+            backwards_edges = set(candidates) - set(chain)
+            if backwards_edges:
+                for edge in backwards_edges:
+                    if not isclose(start_point, edge.start, gap_tol):
+                        edge = edge.reversed()
+                    todo.append(chain + (edge,))
+            else:
+                forward_chains.append(chain)
+        return forward_chains
+
+    def reverse_search(self, forward_chains: list[tuple[Edge, ...]]) -> None:
+        deposit = self.deposit
+        gap_tol = deposit.gap_tol
+        watchdog = self.watchdog
+        todo = forward_chains
+        while todo:
+            if watchdog.has_timed_out:
+                raise TimeoutError("search has timed out", solutions=self.solutions)
+            chain = todo.pop()
+            start_point = chain[0].start
+            candidates = deposit.edges_linked_to(start_point)
+            backwards_edges = set(candidates) - set(chain)
+            if backwards_edges:
+                for edge in backwards_edges:
+                    if not isclose(start_point, edge.end, gap_tol):
+                        edge = edge.reversed()
+                    todo.append((edge,) + chain)
+            else:
+                self.add_solution(chain)
+
+    def add_solution(self, solution: Sequence[Edge]) -> None:
+        keys = self.solution_keys
+        key = chain_key(solution)
+        if key in keys:
+            return
+        keys.add(key)
+        key = chain_key(solution, reverse=True)
+        if key in keys:
+            return
+        keys.add(key)
+        self.solutions.append(solution)
+
+
+def find_closest_loop(
+    edges: Sequence[Edge], pick: UVec, gap_tol=GAP_TOL, timeout=TIMEOUT
+) -> Sequence[Edge]:
+    """Returns the first loop found closest to the pick point."""
+    return find_closest_loop_in_deposit(EdgeDeposit(edges, gap_tol), pick, timeout)
+
+
+def find_closest_loop_in_deposit(
+    deposit: EdgeDeposit, pick: UVec, timeout=TIMEOUT
+) -> Sequence[Edge]:
+    """Returns the first loop found closest to the pick point."""
+    if len(deposit.edges) < 2:
+        return tuple()
+
+    gap_tol = deposit.gap_tol
+    start = deposit.find_nearest_edge(pick)
+    assert start is not None
+    start_point = start.start
+    loop = (start,)
+    watchdog = Watchdog(timeout)
+    while True:
+        if watchdog.has_timed_out:
+            raise TimeoutError("search has timed out")
+        last_edge = loop[-1]
+        end_point = last_edge.end
+        if isclose(start_point, end_point, gap_tol):
+            return loop
+        candidates = set(deposit.edges_linked_to(end_point))
+        for edge in candidates - set(loop):
+            pass
