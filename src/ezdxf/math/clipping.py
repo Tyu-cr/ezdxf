@@ -152,6 +152,8 @@ class ConvexClippingPolygon2d:
             edge_start = vertices[-1]
             for edge_end in vertices:
                 # next polygon edge to test: edge_start -> edge_end
+                if edge_end is None:
+                    continue
                 if is_inside(edge_end):
                     if not is_inside(edge_start):
                         clipped.append(edge_intersection())
