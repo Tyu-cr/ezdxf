@@ -249,6 +249,7 @@ class Configuration:
         lineweight_policy:
         text_policy:
         image_policy: the method for drawing IMAGE entities
+        threshold: a number that is used to check the distance between two points on a two-dimensional space
 
     """
 
@@ -275,6 +276,7 @@ class Configuration:
     lineweight_policy: LineweightPolicy = LineweightPolicy.ABSOLUTE
     text_policy: TextPolicy = TextPolicy.FILLING
     image_policy: ImagePolicy = ImagePolicy.DISPLAY
+    threshold: float = 1.747509e-3
 
     @staticmethod
     def defaults() -> Configuration:
