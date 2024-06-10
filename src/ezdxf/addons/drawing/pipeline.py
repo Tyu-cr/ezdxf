@@ -437,13 +437,15 @@ class ClippingStage2d(RenderStage2d):
     def draw_line(self, start: Vec2, end: Vec2, properties: Properties):
         next_stage = self.next_stage
         clipping_portal = self.clipping_portal
+        skip = calculate_difference(start, end) < self.config.threshold
 
         if clipping_portal.is_active:
             for segment in clipping_portal.clip_line(start, end):
-                if calculate_difference(start, end) >= self.config.threshold:
+                if not skip:
                     next_stage.draw_line(segment[0], segment[1], properties)
             return
-        next_stage.draw_line(start, end, properties)
+        if not skip:
+            next_stage.draw_line(start, end, properties)
 
     def draw_solid_lines(
         self, lines: list[tuple[Vec2, Vec2]], properties: Properties
